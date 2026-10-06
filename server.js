@@ -1,7 +1,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const fs = require('fs');
-const path = require('path');
+const crypto = require('crypto');
 const multer = require('multer');
 const https = require('https');
 const querystring = require('querystring');
@@ -9,894 +8,669 @@ const ExcelJS = require('exceljs');
 const { Resend } = require('resend');
 const { createClient } = require('@supabase/supabase-js');
 
+// ===== DATABASE (Supabase / PostgreSQL) - tables are created by schema.sql =====
+const SUPABASE_URL = process.env.SUPABASE_URL, SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
+if (!SUPABASE_URL || !SUPABASE_KEY) { console.error('Set SUPABASE_URL and SUPABASE_SERVICE_KEY first.'); process.exit(1); }
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
+const q = async p => { const { data, error } = await p; if (error) throw new Error(error.message); return data; };
+const cnt = async (t, f) => { let b = sb.from(t).select('id', { count: 'exact', head: true }); if (f) b = f(b); const { count, error } = await b; if (error) throw new Error(error.message); return count; };
+const m = r => r && { ...r, _id: r.id };           // the dashboard uses _id
+const ZERO = '00000000-0000-0000-0000-000000000000';
+const CFG = 'id,systemName,school,sched,latestUid,lastPing,lastScan,adminUser,adminPass,enableEmail,enableSms,semaphoreApiKey';
+const getConfig = async () => (await q(sb.from('config').select(CFG).eq('id', 1).maybeSingle())) || (await q(sb.from('config').insert({ id: 1 }).select(CFG).single()));
+const setConfig = u => q(sb.from('config').update(u).eq('id', 1));
+const log = a => sb.from('logs').insert({ username: 'admin', action: a }).then(() => {}, () => {});
+const notify = (message, level = 'info') => sb.from('notifications').insert({ message, level }).then(() => {}, () => {});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+const TZ = 'Asia/Manila'; // school time, even when hosted on a UTC server
+const ymd = d => d.toLocaleDateString('en-CA', { timeZone: TZ });
+const hm = d => d.toLocaleTimeString('en-GB', { timeZone: TZ, hour12: false }).slice(0, 5);
+const sha = p => crypto.createHash('sha256').update(String(p)).digest('hex');
+const W = f => (req, res) => f(req, res).catch(e => { console.error(e); res.status(500).json({ error: e.message }); });
 
-// SUPABASE CONNECTION
-const SUPABASE_URL = process.env.SUPABASE_URL || 'YOUR_SUPABASE_URL';
-const SUPABASE_KEY = process.env.SUPABASE_KEY || 'YOUR_SUPABASE_SERVICE_ROLE_OR_ANON_KEY';
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+// ===== EMBEDDED PAGES (dashboard, scanner, stylesheet) =====
+const CSS = `:root{--ink:#12263a;--bg:#eef1f5;--line:#dde3ea;--green:#1f8a5b;--amber:#e8a317;--red:#d64545;--blue:#2f6fdb;--mut:#6b7a8c}
+*{box-sizing:border-box}
+body{margin:0;font-family:Figtree,'Segoe UI',sans-serif;background:var(--bg);color:#1c2733;font-size:15px}
+.app{display:flex;min-height:100vh}
+nav{width:255px;flex-shrink:0;background:var(--ink);color:#cfd8e3;padding:14px 10px;position:sticky;top:0;height:100vh;overflow-y:auto}
+nav .brand{display:flex;align-items:center;gap:10px;padding:6px 10px 16px;color:#fff;font-weight:700;line-height:1.2}
+nav .brand img{height:42px;border-radius:6px}
+nav a{display:block;padding:8px 12px;border-radius:6px;color:inherit;text-decoration:none;font-size:14px}
+nav a:hover{background:#1d3a55}nav a.on{background:var(--green);color:#fff;font-weight:600}
+main{flex:1;min-width:0;padding:26px 30px}
+h2{margin:0 0 4px;font-size:26px;color:var(--ink)}.sub{color:var(--mut);margin:0 0 18px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:22px}
+.stat{background:#fff;border-radius:10px;padding:16px 18px;border-left:5px solid var(--blue)}
+.stat b{display:block;font-size:34px;line-height:1.1}.stat span{color:var(--mut);font-size:13px}
+.stat.g{border-color:var(--green)}.stat.r{border-color:var(--red)}.stat.a{border-color:var(--amber)}
+.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;align-items:end}
+label{font-size:13px;font-weight:600;color:#34495e;display:block}
+input,select,textarea{width:100%;padding:9px 10px;margin-top:4px;border:1px solid #c9d2dc;border-radius:6px;font:inherit;background:#fff}
+button{background:var(--green);color:#fff;border:0;border-radius:6px;padding:10px 16px;font:inherit;font-weight:600;cursor:pointer}
+button.alt{background:var(--blue)}button.danger{background:var(--red)}button.warn{background:var(--amber)}
+button.sm{padding:5px 10px;font-size:12px;margin:1px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}.bar>*{width:auto;margin:0}
+.tw{overflow-x:auto;background:#fff;border-radius:10px}
+table{width:100%;border-collapse:collapse}
+th{background:#f6f8fa;text-align:left;font-size:13px;color:var(--mut);padding:10px 12px;border-bottom:1px solid var(--line)}
+td{padding:9px 12px;border-bottom:1px solid #eef1f4;vertical-align:middle}
+.who{display:flex;align-items:center;gap:10px}.who small{display:block;color:var(--mut)}
+.av{width:38px;height:38px;border-radius:50%;object-fit:cover;background:#d9e2ec;display:inline-flex;align-items:center;justify-content:center;font-weight:700;color:var(--ink)}
+.b{font-style:normal;font-size:12px;font-weight:700;padding:3px 8px;border-radius:5px;color:#fff;margin-right:3px;display:inline-block}
+.b.green{background:var(--green)}.b.red{background:var(--red)}.b.amber{background:var(--amber)}.b.blue{background:var(--blue)}
+.empty{color:var(--mut);padding:24px;text-align:center}
+.bars{display:flex;align-items:flex-end;gap:8px;height:220px}
+.col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%;font-size:11px;color:var(--mut)}
+.col div{width:100%;background:var(--green);border-radius:4px 4px 0 0;position:relative}.col div i{position:absolute;bottom:0;width:100%;background:var(--red)}
+dialog{border:0;border-radius:12px;padding:22px;width:min(560px,94vw)}dialog::backdrop{background:#0008}
+.login{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.box{background:#fff;padding:28px;border-radius:12px;width:100%;max-width:380px;display:flex;flex-direction:column;gap:12px;text-align:center}
+.box h2{font-size:22px}.box p{margin:0;color:var(--mut)}.err{color:var(--red)!important}.box img{align-self:center}
+@media(max-width:800px){.app{flex-direction:column}nav{width:100%;height:auto;position:static;max-height:240px}main{padding:16px}}
+`;
 
-// AUTOMATICALLY GENERATE TEMPLATE.XLSX IF MISSING
-async function ensureExcelTemplateExists() {
-  const templatePath = path.join(__dirname, 'template.xlsx');
-  
-  if (fs.existsSync(templatePath)) {
-    console.log('[EXCEL TEMPLATE] "template.xlsx" already exists.');
-    return;
-  }
+const INDEX_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>School Attendance</title>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="app"><nav id="nav"></nav><main id="view"></main></div>
+<dialog id="dlg"><form onsubmit="return saveStu(event)">
+  <h2 id="dt">Student</h2><input type="hidden" id="s_id">
+  <div class="grid">
+    <label>RFID card UID<input id="s_uid"></label>
+    <label>ID number<input id="s_studentId" required></label>
+    <label>Full name<input id="s_name" required></label>
+    <label>Grade level<select id="s_yearLevel"></select></label>
+    <label>Section<input id="s_section" required></label>
+    <label>Parent email<input id="s_email" type="email"></label>
+    <label>Parent phone<input id="s_phone"></label>
+    <label>Photo (max 1 MB)<input id="s_photo" type="file" accept="image/*"></label>
+  </div><p style="margin:14px 0 0"><button>Save student</button> <button type="button" class="alt" onclick="lastUid()">Use last scanned card</button> <button type="button" class="danger" onclick="dlg.close()">Cancel</button></p>
+</form></dialog>
+<script>
+const MENU=[['dashboard','🏠','Dashboard'],['scanner','📡','RFID Scanner','/scanner'],['students','👨‍🎓','Students'],['cards','💳','RFID Cards'],['grades','🏫','Grade Levels'],['sections','📚','Sections'],['teachers','👨‍🏫','Teachers'],['daily','📅','Daily Attendance'],['timeinout','🕐','Time In / Time Out'],['late','⚠️','Late Students'],['absent','❌','Absent Students'],['early','🚪','Early Out'],['reports','📊','Attendance Reports'],['analytics','📈','Attendance Analytics'],['search','🔍','Search Records'],['unauthorized','🚨','Unauthorized RFID'],['esp','📡','ESP8266 Status'],['notifications','🔔','Notifications'],['announcements','📢','Announcements'],['excuses','📋','Excuse/Absence Records'],['export','📤','Export Reports'],['schedule','⚙️','Attendance Schedule'],['school','🏫','School Information'],['admin','👤','Admin Account'],['logs','📝','Activity Logs'],['backup','💾','Backup & Restore'],['logout','🚪','Logout','/logout']];
+const $=s=>document.querySelector(s),dlg=$('#dlg');
+const api=async(u,o)=>{const r=await fetch(u,o);if(r.status===401)location='/login';const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||'Request failed');return j};
+const post=(u,b)=>api(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const dayAgo=n=>new Date(Date.now()-n*864e5).toLocaleDateString('en-CA',{timeZone:'Asia/Manila'});
+const fmt=v=>/^\\d{4}-\\d\\d-\\d\\dT/.test(v)?new Date(v).toLocaleString():v;
+const h=(t,s='')=>\`<h2>\${t}</h2><p class="sub">\${s}</p>\`;
+const table=(cols,rows)=>rows.length?\`<div class="tw"><table><thead><tr>\${cols.map(c=>\`<th>\${c[0]}</th>\`).join('')}</tr></thead><tbody>\${rows.map(r=>\`<tr>\${cols.map(c=>\`<td>\${c[1](r)}</td>\`).join('')}</tr>\`).join('')}</tbody></table></div>\`:'<p class="empty">Nothing to show yet.</p>';
+let cur='dashboard',GR=[],CACHE={};
+const gradeOpts=()=>GR.map(g=>\`<option>\${esc(g.name)}</option>\`).join('');
 
-  console.log('[EXCEL TEMPLATE] Generating professional attendance template...');
-  
-  const workbook = new ExcelJS.Workbook();
-  const worksheet = workbook.addWorksheet('Attendance Log');
+// attendance table pieces
+const av=r=>r.photo?\`<img class="av" src="\${esc(r.photo)}">\`:\`<span class="av">\${esc((r.name||'?')[0])}</span>\`;
+const who=r=>\`<div class="who">\${av(r)}<div><b>\${esc(r.name)}</b><small>\${esc(r.studentId)}</small></div></div>\`;
+const badge=r=>r.absent?'<i class="b red">ABSENT</i>':(r.late?'<i class="b red">LATE</i>':'')+(r.earlyOut?'<i class="b amber">EARLY OUT</i>':'')||'<i class="b green">ON TIME</i>';
+const ATT=[['Student',who],['Grade & Section',r=>\`\${esc(r.yearLevel)} - \${esc(r.section)}\`],['AM In',r=>r.amIn||'–'],['AM Out',r=>r.amOut||'–'],['PM In',r=>r.pmIn||'–'],['PM Out',r=>r.pmOut||'–'],['Status',badge]];
+const attTable=async(q,cols=ATT)=>table(cols,await api('/api/attendance?'+new URLSearchParams(q)));
+const attView=(t,s,f)=>async()=>h(t,s)+await attTable({filter:f});
 
-  worksheet.columns = [
-    { key: 'studentId', width: 18 },
-    { key: 'name', width: 28 },
-    { key: 'gradeSection', width: 20 },
-    { key: 'position', width: 18 },
-    { key: 'event', width: 24 },
-    { key: 'scanType', width: 15 },
-    { key: 'status', width: 15 },
-    { key: 'duration', width: 15 },
-    { key: 'timestamp', width: 25 }
-  ];
+const V={};
+V.dashboard=async()=>{
+  const [s,ann]=await Promise.all([api('/api/stats'),api('/api/announcements')]);
+  const c=(n,l,k='')=>\`<div class="stat \${k}"><b>\${n}</b><span>\${l}</span></div>\`;
+  return h('Dashboard','Today at school')+\`<div class="stats">\${c(s.total,'Total students')}\${c(s.present,'Present','g')}\${c(s.absent,'Absent','r')}\${c(s.late,'Late','a')}\${c(s.inside,'Inside the school','g')}\${c(s.early,'Early out','a')}</div>\`
+   +\`<h3>Latest arrivals</h3>\`+(await attTable({})).split('</tr>').slice(0,9).join('</tr>')+(ann.length?\`</tbody></table></div><div class="card" style="margin-top:18px"><h3>📢 \${esc(ann[0].title)}</h3><p>\${esc(ann[0].message)}</p></div>\`:'</tbody></table></div>');
+};
+V.daily=attView('Daily Attendance','Everyone who scanned today');
+V.late=attView('Late Students','Arrived after the late time');
+V.absent=attView('Absent Students','No scan today and no excuse on file','absent');
+V.early=attView('Early Out','Left before dismissal','early');
+V.timeinout=async()=>h('Time In / Time Out','Every tap recorded today')+table([['Time',r=>r.time],['Student',r=>\`<b>\${esc(r.name)}</b><br><small>\${esc(r.studentId)}</small>\`],['Action',r=>\`<i class="b \${r.action==='TIME-IN'?'blue':'amber'}">\${r.action}</i>\`],['Period',r=>r.period],['Status',r=>esc(r.status)]],await api('/api/scanlogs?date='+dayAgo(0)));
 
-  worksheet.mergeCells('B1:H1');
-  worksheet.mergeCells('B2:H2');
-
-  worksheet.getCell('B1').value = 'GENERAL ATTENDANCE MANAGEMENT SYSTEM';
-  worksheet.getCell('B1').font = { name: 'Segoe UI', size: 16, bold: true, color: { argb: 'FF1B365D' } };
-  worksheet.getCell('B1').alignment = { horizontal: 'center', vertical: 'middle' };
-
-  worksheet.getCell('B2').value = 'OFFICIAL ATTENDANCE REPORT LOG';
-  worksheet.getCell('B2').font = { name: 'Segoe UI', size: 11, italic: true, color: { argb: 'FF777777' } };
-  worksheet.getCell('B2').alignment = { horizontal: 'center', vertical: 'middle' };
-
-  const headers = [
-    'ID NUMBER', 'FULL NAME', 'GROUP / SECTION', 
-    'POSITION / ROLE', 'EVENT NAME', 'SCAN TYPE', 
-    'STATUS', 'DURATION', 'TIMESTAMP'
-  ];
-
-  const headerRow = worksheet.getRow(4);
-  headerRow.values = headers;
-  headerRow.height = 26;
-
-  headerRow.eachCell((cell) => {
-    cell.font = { name: 'Segoe UI', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1B365D' } };
-    cell.alignment = { horizontal: 'center', vertical: 'middle' };
-    cell.border = {
-      top: { style: 'thin', color: { argb: 'FFD3D3D3' } },
-      left: { style: 'thin', color: { argb: 'FFD3D3D3' } },
-      bottom: { style: 'thin', color: { argb: 'FFD3D3D3' } },
-      right: { style: 'thin', color: { argb: 'FFD3D3D3' } }
-    };
-  });
-
-  await workbook.xlsx.writeFile(templatePath);
-  console.log('[EXCEL TEMPLATE] "template.xlsx" created successfully!');
+// students + cards
+V.students=async()=>{
+  CACHE.students=await api('/api/students');
+  return h('Students','Add, edit, delete and view student information')+\`<p><button onclick="openStu()">+ Add student</button> <a href="/student-register" target="_blank">Self-registration link</a></p>\`
+   +table([['Student',who],['Grade & Section',r=>\`\${esc(r.yearLevel)} - \${esc(r.section)}\`],['Parent contact',r=>esc([r.email,r.phone].filter(Boolean).join(' / '))||'–'],['RFID',r=>r.uid?\`<code>\${esc(r.uid)}</code>\`:'<i class="b amber">No card</i>'],['',r=>\`<button class="sm" onclick="openStu('\${r._id}')">Edit</button><button class="sm danger" onclick="delStu('\${r._id}')">Delete</button>\`]],CACHE.students);
+};
+V.cards=async()=>h('RFID Cards','Register, assign, replace, deactivate or block cards')+table([['Student',who],['Card UID',r=>r.uid?\`<code>\${esc(r.uid)}</code>\`:'–'],['Card status',r=>r.uid?\`<i class="b \${r.cardStatus==='active'?'green':'red'}">\${r.cardStatus.toUpperCase()}</i>\`:'–'],['',r=>\`<button class="sm alt" onclick="cardAct('\${r._id}','assign')">\${r.uid?'Replace':'Assign'}</button>\`+(r.uid?\`<button class="sm warn" onclick="cardAct('\${r._id}','\${r.cardStatus==='active'?'inactive':'active'}')">\${r.cardStatus==='active'?'Deactivate':'Activate'}</button><button class="sm danger" onclick="cardAct('\${r._id}','blocked')">Block</button>\`:'')]],await api('/api/students'));
+function openStu(id){
+  const s=(CACHE.students||[]).find(x=>x._id===id)||{};
+  $('#dt').innerText=id?'Edit student':'Add student';$('#s_id').value=id||'';$('#s_yearLevel').innerHTML=gradeOpts();
+  ['uid','studentId','name','yearLevel','section','email','phone'].forEach(k=>$('#s_'+k).value=s[k]||(k==='yearLevel'?GR[0]?.name:''));
+  $('#s_photo').value='';dlg.showModal();
+}
+async function lastUid(){$('#s_uid').value=(await api('/api/config')).latestUid||''}
+async function saveStu(e){
+  e.preventDefault();const f=new FormData();f.append('mongoId',$('#s_id').value);
+  ['uid','studentId','name','yearLevel','section','email','phone'].forEach(k=>f.append(k,$('#s_'+k).value));
+  if($('#s_photo').files[0])f.append('photo',$('#s_photo').files[0]);
+  try{await api('/api/register',{method:'POST',body:f});dlg.close();go(cur)}catch(x){alert(x.message)}
+}
+async function delStu(id){if(confirm('Remove this student?')){await post('/api/delete-student',{id});go(cur)}}
+async function cardAct(id,act){
+  const b={id,cardStatus:act};
+  if(act==='assign'){const u=prompt('Scan the new card, then confirm its UID:',(await api('/api/config')).latestUid);if(!u)return;b.uid=u;b.cardStatus='active'}
+  try{await post('/api/card',b)}catch(x){alert(x.message)}go(cur);
 }
 
-async function getConfig() {
-  const { data, error } = await supabase.from('config').select('*').eq('id', 1).single();
-  if (error || !data) {
-    const defaultConfig = {
-      id: 1,
-      system_name: 'General Attendance System',
-      logo_path: '',
-      events: ['General Event', 'Orientation', 'Meeting', 'Seminar'],
-      current_event: 'General Event',
-      cutoff_time: '08:00',
-      latest_uid: '',
-      enable_email: false,
-      gmail_user: '',
-      gmail_pass: '',
-      enable_sms: false,
-      semaphore_api_key: ''
-    };
-    await supabase.from('config').upsert([defaultConfig]);
-    return defaultConfig;
-  }
-  return data;
-}
-
-// UPLOADS SETUP FOR LOGOS & PARTICIPANT PHOTOS
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
+// simple lists: grades, sections, teachers, announcements, excuses
+const CR={
+ grades:{t:'Grade Levels',f:[['name','Grade name']],c:['name']},
+ sections:{t:'Sections',f:[['yearLevel','Grade level','grade'],['name','Section name'],['adviser','Adviser']],c:['yearLevel','name','adviser']},
+ teachers:{t:'Teachers',f:[['name','Full name'],['email','Email'],['phone','Phone'],['subject','Subject'],['username','Login username']],c:['name','subject','email','phone','username']},
+ announcements:{t:'Announcements',f:[['title','Title'],['message','Message','area']],c:['title','message','at']},
+ excuses:{t:'Excuse / Absence Records',f:[['studentId','Student ID'],['name','Student name'],['date','Date','date'],['reason','Reason']],c:['date','studentId','name','reason']}
+};
+Object.keys(CR).forEach(k=>V[k]=async()=>{
+  const d=CR[k],rows=CACHE[k]=await api('/api/'+k);
+  const inp=([n,l,t])=>\`<label>\${l}\${t==='grade'?\`<select id="f_\${n}">\${gradeOpts()}</select>\`:t==='area'?\`<textarea id="f_\${n}"></textarea>\`:\`<input id="f_\${n}" type="\${t||'text'}">\`}</label>\`;
+  return h(d.t)+\`<form class="card grid" onsubmit="return saveC('\${k}',event)"><input type="hidden" id="f__id">\${d.f.map(inp).join('')}<button>Save</button></form>\`
+   +table([...d.c.map(c=>[c,r=>esc(fmt(r[c]))]),['',r=>\`<button class="sm" onclick="editC('\${k}','\${r._id}')">Edit</button><button class="sm danger" onclick="delC('\${k}','\${r._id}')">Delete</button>\`]],rows);
 });
+async function saveC(k,e){e.preventDefault();const b={_id:$('#f__id').value};CR[k].f.forEach(([n])=>b[n]=$('#f_'+n).value);await post('/api/'+k,b);if(k==='grades')GR=await api('/api/grades');go(cur);}
+function editC(k,id){const r=CACHE[k].find(x=>x._id===id);$('#f__id').value=id;CR[k].f.forEach(([n])=>$('#f_'+n).value=r[n]||'');scrollTo(0,0)}
+async function delC(k,id){if(confirm('Delete this record?')){await api('/api/'+k+'/'+id,{method:'DELETE'});if(k==='grades')GR=await api('/api/grades');go(cur)}}
 
-const upload = multer({ 
-  storage,
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith('image/')) cb(null, true);
-    else cb(new Error('Only image files are allowed!'), false);
-  }
-});
+// read-only lists
+V.unauthorized=async()=>h('Unauthorized RFID','Unknown, blocked or inactive cards that were tapped')+table([['Card UID',r=>\`<code>\${esc(r.uid)}</code>\`],['Reason',r=>esc(r.reason)],['Taps',r=>r.count],['Last seen',r=>fmt(r.lastSeen)],['',r=>\`<button class="sm danger" onclick="delC('unauthorized','\${r._id}')">Dismiss</button>\`]],await api('/api/unauthorized'));
+V.notifications=async()=>h('Notifications','Late students, early outs and card alerts')+table([['When',r=>fmt(r.at)],['Message',r=>\`<i class="b \${r.level==='warning'?'amber':'blue'}">\${r.level||'info'}</i> \${esc(r.message)}\`]],await api('/api/notifications'));
+V.logs=async()=>h('Activity Logs','What administrators did')+table([['When',r=>fmt(r.at)],['User',r=>esc(r.username)],['Action',r=>esc(r.action)]],await api('/api/logs'));
+V.esp=async()=>{const e=await api('/api/esp');return h('ESP8266 Status','Is the RFID scanner connected?')+\`<div class="card"><h3><i class="b \${e.connected?'green':'red'}">\${e.connected?'CONNECTED':'OFFLINE'}</i></h3><p>Last signal: \${e.lastPing?fmt(e.lastPing):'never'}</p><p>Last card UID: <code>\${esc(e.latestUid||'none')}</code></p><p class="sub">The scanner counts as connected if it sent a scan or <code>POST /api/ping</code> in the last 60 seconds.</p></div>\`};
 
-// MIDDLEWARES
+// reports, search, export (shared filter bar)
+const filterBar=()=>\`<div class="bar"><select id="pre" onchange="preset()"><option value="0">Daily</option><option value="6">Weekly</option><option value="29">Monthly</option><option value="179">Semester</option></select><input type="date" id="from" value="\${dayAgo(0)}"><input type="date" id="to" value="\${dayAgo(0)}"><select id="fg"><option value="">All grades</option>\${gradeOpts()}</select><input id="fs" placeholder="Section"><input id="fq" placeholder="Student name or ID"><button onclick="runF()">Search</button><button class="alt" onclick="dl('excel')">Excel</button><button class="alt" onclick="dl('csv')">CSV</button></div><div id="res"></div>\`;
+const fq=()=>new URLSearchParams({from:$('#from').value,to:$('#to').value,grade:$('#fg').value,section:$('#fs').value,q:$('#fq').value});
+const preset=()=>{$('#from').value=dayAgo(+$('#pre').value);$('#to').value=dayAgo(0)};
+const runF=async()=>{$('#res').innerHTML=await attTable(fq(),[['Date',r=>r.date],...ATT])};
+const dl=f=>location='/api/export-excel?format='+f+'&'+fq();
+V.reports=async()=>h('Attendance Reports','Daily, weekly, monthly and semester reports')+filterBar();
+V.search=async()=>h('Search Records','Find attendance by student, section, grade or date')+filterBar();
+V.export=async()=>h('Export Reports','Download attendance as Excel or CSV')+filterBar();
+V.analytics=async()=>{
+  const a=await api('/api/analytics'),avg=Math.round(a.days.reduce((s,d)=>s+d.present,0)/Math.max(a.total*a.days.length,1)*100);
+  return h('Attendance Analytics','Last 14 days · green = present, red = late')+\`<div class="stats"><div class="stat g"><b>\${avg}%</b><span>Average attendance</span></div></div><div class="card"><div class="bars">\${a.days.map(d=>{const p=a.total?Math.round(d.present/a.total*100):0;return \`<div class="col">\${p}%<div style="height:\${p*1.7}px"><i style="height:\${d.present?d.late/d.present*100:0}%"></i></div>\${d.date.slice(5)}</div>\`}).join('')}</div></div>\`;
+};
+
+// settings
+const frm=(id,body,fn)=>\`<form class="card grid" onsubmit="return \${fn}(event)">\${body}<button>Save</button></form>\`;
+const cfgPost=async(e,keys)=>{e.preventDefault();const b={};keys.forEach(k=>b[k]=$('#c_'+k.replace('.','_')).value);await post('/api/config',b);alert('Saved');return false};
+const cf=(c,k,l,t='text')=>{const v=k.split('.').reduce((o,p)=>o?.[p],c)||'';return \`<label>\${l}<input id="c_\${k.replace('.','_')}" type="\${t}" value="\${esc(v)}"></label>\`};
+V.schedule=async()=>{const c=await api('/api/config'),k=['sched.opening','sched.late','sched.noon','sched.dismissal'];window.sk=k;
+  return h('Attendance Schedule','Used to decide late, AM/PM and early out')+frm('',cf(c,k[0],'School opening','time')+cf(c,k[1],'Late after','time')+cf(c,k[2],'Morning ends / afternoon starts','time')+cf(c,k[3],'Dismissal (leaving earlier = early out)','time'),'saveSched')};
+const saveSched=e=>cfgPost(e,window.sk);
+V.school=async()=>{const c=await api('/api/config'),k=['school.name','school.address','school.contact','systemName'];window.sk2=k;
+  return h('School Information','Name, logo, address and contact')+frm('',cf(c,k[0],'School name')+cf(c,k[1],'Address')+cf(c,k[2],'Contact')+cf(c,k[3],'System name'),'saveSchool')
+   +\`<div class="card"><label>School logo<input type="file" id="logo" accept="image/*"></label><p><button class="alt" onclick="upLogo()">Upload logo</button> \${c.logoPath?\`<button class="danger" onclick="rmLogo()">Remove logo</button> <img src="\${c.logoPath}" height="40">\`:''}</p></div>\`};
+const saveSchool=e=>cfgPost(e,window.sk2);
+async function upLogo(){const f=new FormData();f.append('logoFile',$('#logo').files[0]);await api('/api/upload-logo',{method:'POST',body:f});init()}
+async function rmLogo(){await post('/api/remove-logo',{});init()}
+V.admin=async()=>h('Admin Account','Change the administrator username or password')+frm('',\`<label>Username<input id="a_u" value="admin"></label><label>Current password<input id="a_o" type="password" required></label><label>New password<input id="a_n" type="password" placeholder="Leave blank to keep"></label>\`,'saveAdmin');
+async function saveAdmin(e){e.preventDefault();try{await post('/api/admin',{username:$('#a_u').value,oldPass:$('#a_o').value,newPass:$('#a_n').value});alert('Account updated')}catch(x){alert(x.message)}return false}
+V.backup=async()=>h('Backup & Restore','Save or reload students and attendance data')+\`<div class="card"><p><a href="/api/backup"><button>Download backup</button></a></p><label>Restore from backup file<input type="file" id="rf" accept=".json"></label><p><button class="alt" onclick="restore()">Restore data</button> <button class="danger" onclick="clearLogs()">Clear attendance logs</button></p></div>\`;
+async function restore(){const f=$('#rf').files[0];if(!f||!confirm('This replaces current data. Continue?'))return;await post('/api/restore',JSON.parse(await f.text()));alert('Restored')}
+async function clearLogs(){if(confirm('Clear ALL attendance logs?')){await post('/api/clear-logs',{});alert('Cleared')}}
+
+// router
+const LIVE=['dashboard','daily','late','absent','early','timeinout','unauthorized','esp','notifications'];
+async function go(k){
+  cur=k||'dashboard';
+  $('#nav a.on')?.classList.remove('on');$('#nav a[data-k="'+cur+'"]')?.classList.add('on');
+  try{$('#view').innerHTML=await V[cur]();if(cur==='reports'||cur==='search'||cur==='export')runF()}catch(e){$('#view').innerHTML='<p class="empty">'+esc(e.message)+'</p>'}
+}
+async function init(){
+  GR=await api('/api/grades');const c=await api('/api/config');
+  $('#nav').innerHTML=\`<div class="brand">\${c.logoPath?\`<img src="\${c.logoPath}">\`:'🎓'}<span>\${esc(c.school.name)}</span></div>\`+MENU.map(m=>\`<a data-k="\${m[0]}" href="\${m[3]||'#'+m[0]}" \${m[0]==='scanner'?'target="_blank"':''}>\${m[1]} \${m[2]}</a>\`).join('');
+  document.querySelectorAll('nav img').forEach(i=>i.onerror=()=>i.remove());
+  go(cur);
+}
+addEventListener('hashchange',()=>go(location.hash.slice(1)));
+setInterval(()=>{if(LIVE.includes(cur)&&!document.hidden)go(cur)},8000);
+cur=location.hash.slice(1)||'dashboard';init();
+</script>
+</body>
+</html>
+`;
+
+const SCANNER_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RFID Scanner</title>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}
+body{margin:0;height:100vh;display:flex;flex-direction:column;background:#0d1b2a;color:#fff;font-family:Figtree,'Segoe UI',sans-serif;overflow:hidden}
+header{display:flex;align-items:center;gap:16px;padding:16px 32px;background:#12263a}
+header img{height:56px;border-radius:8px}header h1{margin:0;font-size:26px;flex:1}
+#clock{font-size:42px;font-weight:800;text-align:right;line-height:1}#clock small{display:block;font-size:15px;font-weight:400;color:#9fb3c8}
+.wrap{flex:1;display:flex;gap:24px;padding:24px 32px;min-height:0}
+#stage{flex:1;border-radius:20px;background:#12263a;display:flex;align-items:center;justify-content:center;gap:48px;padding:32px;transition:background .3s}
+#stage.ok{background:#14532d}#stage.late{background:#7c4a03}#stage.bad{background:#7f1d1d}
+#idle{text-align:center;font-size:40px;font-weight:800}#idle p{font-size:20px;font-weight:400;color:#9fb3c8}
+.ring{width:150px;height:150px;border:8px solid #2f6fdb;border-radius:50%;margin:0 auto 24px;animation:pulse 2s infinite}
+@keyframes pulse{50%{transform:scale(1.08);opacity:.5}}@media(prefers-reduced-motion:reduce){.ring{animation:none}}
+#card{display:none;align-items:center;gap:48px;width:100%}
+#photo{width:min(34vw,380px);aspect-ratio:3/4;border-radius:18px;object-fit:cover;background:#1d3a55;font-size:120px;display:flex;align-items:center;justify-content:center}
+#info{flex:1;min-width:0}#name{font-size:clamp(34px,5vw,64px);font-weight:800;line-height:1.1}
+#grade{font-size:30px;color:#cfe3f5;margin:10px 0}#id{font-size:20px;color:#9fb3c8}
+#type{display:inline-block;margin-top:22px;font-size:34px;font-weight:800;padding:10px 26px;border-radius:12px;background:#ffffff26}
+#time{font-size:56px;font-weight:800;margin-top:14px}
+aside{width:320px;display:flex;flex-direction:column;gap:16px}
+.box{background:#12263a;border-radius:16px;padding:16px}.box h3{margin:0 0 10px;font-size:15px;color:#9fb3c8;font-weight:600}
+.cnt{display:flex;gap:10px}.cnt div{flex:1;font-size:13px;color:#9fb3c8}.cnt b{display:block;font-size:34px;color:#fff}
+#recent div{padding:7px 0;border-bottom:1px solid #1d3a55;font-size:14px;display:flex;justify-content:space-between;gap:8px}
+#ann{padding:12px 32px;background:#12263a;font-size:18px;color:#cfe3f5;min-height:48px}
+#start{position:fixed;right:16px;bottom:64px;z-index:9;display:flex;align-items:center;gap:10px;background:#12263a;border:2px solid #1f8a5b;padding:10px 16px;border-radius:12px;font-size:16px}
+#start button{font:inherit;font-weight:800;padding:8px 18px;border:0;border-radius:8px;background:#1f8a5b;color:#fff;cursor:pointer}
+#net{position:fixed;left:16px;bottom:64px;font-size:13px;color:#9fb3c8}
+@media(max-width:900px){aside{display:none}#card{flex-direction:column;gap:20px}#photo{width:50vw}}
+</style>
+</head>
+<body>
+<div id="start">🔊 Voice is off <button onclick="begin()">Turn on voice</button></div><div id="net">Connecting…</div>
+<header><img id="logo" hidden><h1 id="school">School Attendance</h1><div id="clock"></div></header>
+<div class="wrap">
+  <div id="stage">
+    <div id="idle"><div class="ring"></div>Please tap your ID<p>Hold your RFID card near the reader</p></div>
+    <div id="card"><div id="photo"></div><div id="info"><div id="name"></div><div id="grade"></div><div id="id"></div><div id="type"></div><div id="time"></div></div></div>
+  </div>
+  <aside>
+    <div class="box"><h3>Today</h3><div class="cnt"><div><b id="cp">0</b>Present</div><div><b id="cl">0</b>Late</div><div><b id="ci">0</b>Inside</div></div></div>
+    <div class="box"><h3>Test without the reader</h3><input id="tu" placeholder="Type a card UID" style="width:100%;padding:8px;border-radius:6px;border:0;margin-bottom:8px"><button onclick="testScan()" style="width:100%;padding:8px;border:0;border-radius:6px;background:#2f6fdb;color:#fff;font-weight:600;cursor:pointer">Scan</button><div id="tr" style="margin-top:8px;font-size:13px;color:#cfe3f5"></div></div>
+    <div class="box" style="flex:1;overflow:hidden"><h3>Recent scans</h3><div id="recent"></div></div>
+  </aside>
+</div>
+<div id="ann"></div>
+<script>
+const $=s=>document.querySelector(s);
+let seen=null,voice=false,timer,recent=[],anns=[],ai=0;
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function begin(){if(voice)return;voice=true;$('#start')?.remove();speak('Voice is on')}
+addEventListener('click',begin);addEventListener('keydown',begin);
+function speak(t){if(!voice||!window.speechSynthesis)return;speechSynthesis.cancel();setTimeout(()=>{const u=new SpeechSynthesisUtterance(t);u.rate=.95;speechSynthesis.speak(u)},150)}
+if(window.speechSynthesis)speechSynthesis.getVoices();
+async function testScan(){const u=$('#tu').value.trim();if(!u)return;$('#tr').textContent='Sending…';try{const r=await fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uid:u})});const j=await r.json().catch(()=>({message:'HTTP '+r.status}));$('#tr').textContent='Server says: '+(j.message||j.status)}catch(e){$('#tr').textContent='Cannot reach the server'}}
+setInterval(()=>{const d=new Date();$('#clock').innerHTML=d.toLocaleTimeString('en-US',{timeZone:'Asia/Manila',hour:'2-digit',minute:'2-digit',second:'2-digit'})+'<small>'+d.toLocaleDateString('en-US',{timeZone:'Asia/Manila',weekday:'long',month:'long',day:'numeric'})+'</small>'},1000);
+
+function show(s){
+  clearTimeout(timer);
+  const stage=$('#stage'),done=s.type==='DONE',late=s.status==='LATE'||s.status==='EARLY OUT';
+  stage.className=!s.ok?'bad':late?'late':'ok';
+  $('#idle').style.display='none';$('#card').style.display='flex';
+  const p=$('#photo');
+  if(s.photo){p.style.backgroundImage='url('+s.photo+')';p.style.backgroundSize='cover';p.textContent=''}else{p.style.backgroundImage='';p.textContent=s.ok?(s.name||'?')[0]:'🚫'}
+  $('#name').textContent=s.ok?s.name:s.message;
+  $('#grade').textContent=s.ok?s.yearLevel+' - '+s.section:'Card: '+s.uid;
+  $('#id').textContent=s.ok?'ID '+s.studentId:'Please see the office';
+  $('#type').textContent=!s.ok?'ACCESS DENIED':done?'ALREADY COMPLETE':s.type+' · '+s.period+(late?' · '+s.status:'');
+  $('#time').textContent=s.time||'';
+  const greet=s.period==='PM'?'Good afternoon':'Good morning';
+  speak(!s.ok?'Sorry, '+s.message.toLowerCase()+'. Please see the office.':done?s.name+', you already completed your '+s.period+' scans.':greet+', '+s.name+'. '+(s.type==='TIME-IN'?'Time in':'Time out')+' recorded.'+(s.status==='LATE'?' You are late.':s.status==='EARLY OUT'?' Early out recorded.':''));
+  recent.unshift(\`<div><span>\${esc(s.ok?s.name:s.message)}</span><span>\${esc(s.ok?(s.type||'')+' '+s.time:'denied')}</span></div>\`);recent=recent.slice(0,8);$('#recent').innerHTML=recent.join('');
+  timer=setTimeout(()=>{stage.className='';$('#card').style.display='none';$('#idle').style.display='block'},7000);
+  stats();
+}
+async function poll(){
+  try{const s=await (await fetch('/api/last-scan')).json();if(s.status===401||s.error)return location='/login';
+    $('#net').textContent='● Connected · last card received: '+(s.uid||'none yet');
+    if(seen===null)seen=s.id;else if(s.id!==seen){seen=s.id;show(s)}}catch(e){$('#net').textContent='○ Cannot reach the server'}
+}
+async function stats(){try{const s=await (await fetch('/api/stats')).json();$('#cp').textContent=s.present;$('#cl').textContent=s.late;$('#ci').textContent=s.inside}catch(e){}}
+async function boot(){
+  try{const c=await (await fetch('/api/config')).json();$('#school').textContent=c.school.name;if(c.logoPath){const l=$('#logo');l.onerror=()=>l.remove();l.src=c.logoPath;l.hidden=false}anns=await (await fetch('/api/announcements')).json()}catch(e){}
+  stats();setInterval(stats,15000);setInterval(poll,800);
+  setInterval(()=>{if(anns.length){const a=anns[ai++%anns.length];$('#ann').textContent='📢 '+a.title+': '+a.message}},6000);
+}
+boot();
+</script>
+</body>
+</html>
+`;
+
+
+// UPLOADS (student photos and logo are stored inside the database)
+const imgOnly = (req, f, cb) => f.mimetype.startsWith('image/') ? cb(null, true) : cb(new Error('Only image files are allowed!'), false);
+const photoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1e6 }, fileFilter: imgOnly });
+const logoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5e5 }, fileFilter: imgOnly });
+
+// MIDDLEWARES + LOGIN (signed cookie, survives restarts)
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   next();
 });
-
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use('/uploads', express.static(uploadsDir));
+app.get('/assets/style.css', (req, res) => res.type('css').send(CSS));
 
-// NOTIFICATIONS
+const SECRET = process.env.SECRET || sha(SUPABASE_KEY);
+const sign = v => v + '.' + crypto.createHmac('sha256', SECRET).update(v).digest('hex');
+const valid = t => { const [e, h] = String(t || '').split('.'); return !!h && sign(e) === t && +e > Date.now(); };
+const cookie = req => Object.fromEntries((req.headers.cookie || '').split(';').map(c => c.trim().split('=')));
+const open = ['/login', '/api/scan', '/api/ping', '/student-register', '/api/register-student'];
+app.use((req, res, next) => {
+  if (open.includes(req.path) || req.path.startsWith('/assets') || valid(cookie(req).sid)) return next();
+  req.path.startsWith('/api') ? res.status(401).json({ error: 'Login required' }) : res.redirect('/login');
+});
+
+app.get('/login', W(async (req, res) => {
+  const c = await getConfig(), l = await q(sb.from('config').select('logoPath').eq('id', 1).maybeSingle());
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login</title>
+  <link rel="stylesheet" href="/assets/style.css"></head><body class="login"><form method="POST" action="/login" class="box">
+  ${l && l.logoPath ? `<img src="${l.logoPath}" height="70">` : ''}<h2>${c.school.name}</h2><p>Attendance system admin</p>
+  ${req.query.e ? '<p class="err">Wrong username or password.</p>' : ''}
+  <input name="username" placeholder="Username" required><input name="password" type="password" placeholder="Password" required>
+  <button>Log in</button></form></body></html>`);
+}));
+app.post('/login', W(async (req, res) => {
+  const c = await getConfig();
+  if (req.body.username === c.adminUser && sha(req.body.password) === c.adminPass) {
+    res.setHeader('Set-Cookie', `sid=${sign(String(Date.now() + 864e5))}; HttpOnly; Path=/; Max-Age=86400`);
+    log('Logged in');
+    return res.redirect('/');
+  }
+  res.redirect('/login?e=1');
+}));
+app.get('/logout', (req, res) => { res.setHeader('Set-Cookie', 'sid=; Path=/; Max-Age=0'); res.redirect('/login'); });
+
+// NOTIFICATIONS (EMAIL & SMS)
 const resend = new Resend(process.env.RESEND_API_KEY || 'YOUR_RESEND_API_KEY');
 
-async function sendEmailNotification(recipientEmail, studentName, scanType, status, eventName, timestamp, duration) {
-  if (!recipientEmail) return;
-  const durationText = duration ? `<li><strong>Duration:</strong> ${duration}</li>` : '';
+async function sendEmailNotification(config, to, studentName, label, status, timestamp) {
+  if (!to) return;
   try {
     await resend.emails.send({
-      from: 'Attendance System <onboarding@resend.dev>',
-      to: recipientEmail,
-      subject: `[${scanType}] Attendance Alert: ${studentName}`,
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 15px; border: 1px solid #ddd; border-radius: 6px;">
-          <h2 style="color: #2c3e50;">Attendance Notification (${scanType})</h2>
-          <p>Hello,</p>
-          <p>This is to confirm that <strong>${studentName}</strong> logged <strong>${scanType}</strong>.</p>
-          <ul>
-            <li><strong>Event:</strong> ${eventName}</li>
-            <li><strong>Scan Type:</strong> <span style="color:#2980b9; font-weight:bold;">${scanType}</span></li>
-            <li><strong>Status:</strong> <span style="color:${status === 'LATE' ? '#e74c3c' : '#2ecc71'}; font-weight:bold;">${status}</span></li>
-            <li><strong>Time:</strong> ${timestamp}</li>
-            ${durationText}
-          </ul>
-        </div>
-      `
+      from: 'School Attendance <onboarding@resend.dev>', to,
+      subject: `[${label}] Attendance Alert: ${studentName}`,
+      html: `<div style="font-family:Arial;padding:15px;border:1px solid #ddd;border-radius:6px;">
+        <h2>${config.school.name}</h2>
+        <p><strong>${studentName}</strong> logged <strong>${label}</strong> at ${timestamp}.</p>
+        <p>Status: <strong style="color:${status === 'ON TIME' || status === 'COMPLETED' ? '#2ecc71' : '#e74c3c'}">${status}</strong></p></div>`
     });
-  } catch (error) {
-    console.error('[EMAIL ERROR]', error.message);
-  }
+  } catch (error) { console.error('[EMAIL ERROR]', error.message); }
 }
 
-function calculateDuration(timeInDate, timeOutDate) {
-  const diffMs = timeOutDate - timeInDate;
-  if (isNaN(diffMs) || diffMs < 0) return 'N/A';
-  const totalMinutes = Math.floor(diffMs / (1000 * 60));
-  const hours = Math.floor(totalMinutes / 60);
-  const mins = totalMinutes % 60;
-  return hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
+function sendSMSNotification(config, phoneNumber, studentName, label, status, timestamp) {
+  if (!config.enableSms || !config.semaphoreApiKey || !phoneNumber) return;
+  const postData = querystring.stringify({ apikey: config.semaphoreApiKey, number: phoneNumber, message: `[${config.school.name}] ${studentName}: ${label} at ${timestamp}. Status: ${status}.` });
+  const req = https.request({
+    hostname: 'api.semaphore.co', port: 443, path: '/api/v4/messages', method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': postData.length }
+  }, r => r.on('data', d => console.log('[SMS RESPONSE]', d.toString())));
+  req.on('error', e => console.error('[SMS ERROR]', e.message));
+  req.write(postData); req.end();
 }
 
-// API: ESP8266 / HARDWARE SCANNER ENDPOINT
+// API: ESP8266 SCANNER ENDPOINT (AM in/out + PM in/out)
+const SLOTS = { am: ['amIn', 'amOut'], pm: ['pmIn', 'pmOut'] };
+
+app.get('/api/scan', (req, res) => res.send('Scan endpoint is online. The ESP8266 must POST uid to this address.'));
+app.post('/api/ping', W(async (req, res) => { await setConfig({ lastPing: new Date().toISOString() }); res.json({ status: 'ok' }); }));
+
 app.post('/api/scan', async (req, res) => {
   try {
     const { uid } = req.body;
-    if (!uid) return res.status(400).json({ status: 'error', message: 'No UID provided' });
-
+    if (!uid) return res.status(400).json({ status: 'error', message: 'No UID' });
     const cleanUid = uid.trim().toUpperCase();
+    console.log('[SCAN] received UID:', cleanUid);
     const config = await getConfig();
-    
-    await supabase.from('config').update({ latest_uid: cleanUid }).eq('id', 1);
+    await setConfig({ latestUid: cleanUid, lastPing: new Date().toISOString() });
 
-    const { data: student } = await supabase
-      .from('students')
-      .select('*')
-      .eq('uid', cleanUid)
-      .single();
+    const now = new Date(), date = ymd(now), time = hm(now);
+    const show = o => setConfig({ lastScan: { id: Date.now(), ts: Date.now(), time, uid: cleanUid, ...o } });
+    const prev = config.lastScan || {};
+    if (prev.uid === cleanUid && Date.now() - prev.ts < 4000) return res.json({ status: 'duplicate', message: 'Already scanned' });
 
-    const now = new Date();
-
-    if (student) {
-      const eventName = student.assigned_event || config.current_event || 'General Event';
-      const startOfDay = new Date(now);
-      startOfDay.setHours(0, 0, 0, 0);
-
-      const { data: lastLogs } = await supabase
-        .from('attendance')
-        .select('*')
-        .eq('uid', cleanUid)
-        .eq('event', eventName)
-        .gte('raw_timestamp', startOfDay.toISOString())
-        .order('raw_timestamp', { ascending: false })
-        .limit(1);
-
-      const lastLog = lastLogs && lastLogs.length > 0 ? lastLogs[0] : null;
-
-      let scanType = 'TIME-IN';
-      let duration = '';
-      let statusLabel = 'ON TIME';
-
-      if (lastLog && lastLog.scan_type === 'TIME-IN') {
-        scanType = 'TIME-OUT';
-        statusLabel = 'COMPLETED';
-        duration = calculateDuration(new Date(lastLog.raw_timestamp), now);
-      } else {
-        const currentTimeStr = now.toTimeString().slice(0, 5);
-        statusLabel = currentTimeStr > (config.cutoff_time || '08:00') ? 'LATE' : 'ON TIME';
-      }
-
-      const record = {
-        uid: cleanUid,
-        name: student.name,
-        student_id: student.student_id,
-        year_level: student.year_level || 'N/A',
-        section: student.section || 'N/A',
-        position: student.position || 'Member',
-        email: student.email || '',
-        phone: student.phone || '',
-        event: eventName,
-        scan_type: scanType,
-        status: statusLabel,
-        duration: duration || 'N/A',
-        timestamp: now.toLocaleString(),
-        raw_timestamp: now.toISOString()
-      };
-
-      await supabase.from('attendance').insert([record]);
-
-      if (config.enable_email && student.email) {
-        sendEmailNotification(student.email, student.name, scanType, statusLabel, eventName, record.timestamp, duration);
-      }
-
-      return res.json({ 
-        status: 'success', 
-        scanType, 
-        isLate: statusLabel === 'LATE', 
-        message: `${scanType} recorded for ${student.name}`,
-        student: {
-          name: student.name,
-          studentId: student.student_id,
-          yearLevel: student.year_level,
-          section: student.section,
-          position: student.position,
-          photoUrl: student.photo_url || ''
-        }
-      });
-    } else {
-      return res.json({ status: 'unknown', message: 'Card not registered', uid: cleanUid });
+    const compact = cleanUid.replace(/[\s:-]/g, '');
+    const student = (await q(sb.from('students').select('*').in('uid', [cleanUid, compact]).limit(1)))[0];
+    if (!student || student.cardStatus !== 'active') {
+      const reason = student ? `Card ${student.cardStatus}` : 'Card not registered';
+      const u = await q(sb.from('unauthorized').select('id,count').eq('uid', cleanUid).maybeSingle());
+      await q(u ? sb.from('unauthorized').update({ count: u.count + 1, reason, lastSeen: now.toISOString() }).eq('id', u.id) : sb.from('unauthorized').insert({ uid: cleanUid, reason }));
+      notify(`${reason}: ${cleanUid}`, 'warning');
+      await show({ ok: false, message: reason });
+      return res.json({ status: student ? 'blocked' : 'unknown', message: reason });
     }
+
+    const info = { ok: true, studentId: student.studentId, name: student.name, yearLevel: student.yearLevel, section: student.section, photo: student.photo };
+    let rec = await q(sb.from('daily').select('*').eq('date', date).eq('studentId', student.studentId).maybeSingle());
+    const isNew = !rec;
+    if (isNew) rec = { date, uid: cleanUid, ...info, late: false, earlyOut: false };
+    delete rec.ok;
+    const sc = { opening: '06:00', late: '07:30', noon: '12:00', dismissal: '16:00', ...(config.sched || {}) };
+    const period = time >= sc.noon ? 'pm' : 'am';
+    const slot = SLOTS[period].find(k => !rec[k]);
+    if (!slot) {
+      await show({ ...info, type: 'DONE', period: period.toUpperCase(), status: 'Already completed' });
+      return res.json({ status: 'duplicate', message: `${student.name} already completed ${period.toUpperCase()} scans` });
+    }
+
+    rec[slot] = time;
+    const type = slot.endsWith('In') ? 'TIME-IN' : 'TIME-OUT';
+    let status = type === 'TIME-IN' ? 'ON TIME' : 'COMPLETED';
+    if (slot === 'amIn' && time > sc.late) { rec.late = true; status = 'LATE'; }
+    if (slot === 'pmOut' && time < sc.dismissal) { rec.earlyOut = true; status = 'EARLY OUT'; }
+    await q(isNew ? sb.from('daily').insert(rec) : sb.from('daily').update({ [slot]: time, late: rec.late, earlyOut: rec.earlyOut }).eq('id', rec.id));
+    await show({ ...info, type, period: period.toUpperCase(), status });
+    try {
+      await q(sb.from('scanlogs').insert({ date, time, studentId: student.studentId, name: student.name, uid: cleanUid, action: type, period: period.toUpperCase(), status }));
+      if (status === 'LATE' || status === 'EARLY OUT') notify(`${student.name} (${student.yearLevel}-${student.section}) ${status} at ${time}`, 'warning');
+    } catch (e) { console.error('[SCANLOG ERROR]', e.message); }
+
+    const label = `${type} (${period.toUpperCase()})`;
+    if (config.enableEmail) sendEmailNotification(config, student.email, student.name, label, status, time);
+    sendSMSNotification(config, student.phone, student.name, label, status, time);
+    res.json({ status: 'success', scanType: type, isLate: status === 'LATE', message: `${type} recorded for ${student.name}` });
   } catch (err) {
     console.error('[SCAN ERROR]', err);
-    res.status(500).json({ status: 'error', message: 'Server Error' });
+    await setConfig({ lastScan: { id: Date.now(), ts: Date.now(), time: hm(new Date()), uid: req.body.uid || '', ok: false, message: 'Server error: ' + err.message } }).catch(() => {});
+    res.status(500).json({ status: 'error', message: 'Server Error: ' + err.message });
   }
 });
 
-// REALTIME DATA ENDPOINT FOR DASHBOARD UI
-app.get('/api/live-data', async (req, res) => {
-  try {
-    const config = await getConfig();
-    const { data: students } = await supabase.from('students').select('*').order('name', { ascending: true });
-    const { data: attendance } = await supabase.from('attendance').select('*').order('raw_timestamp', { ascending: false }).limit(100);
+app.get('/api/last-scan', W(async (req, res) => res.json((await q(sb.from('config').select('lastScan').eq('id', 1).maybeSingle()))?.lastScan || { id: 0 })));
+app.get('/api/esp', W(async (req, res) => {
+  const c = await getConfig();
+  res.json({ connected: !!c.lastPing && Date.now() - new Date(c.lastPing) < 60000, lastPing: c.lastPing, latestUid: c.latestUid });
+}));
 
-    // Also attach photo URLs if matching by UID for live scanned display
-    res.json({
-      latestUid: config.latest_uid || '',
-      attendance: attendance || [],
-      students: students || []
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+// ATTENDANCE QUERIES (daily, late, absent, early out, reports, search)
+async function attendance({ from, to, q: text, grade, section, filter }) {
+  const day = from || ymd(new Date());
+  const narrow = b => {
+    if (grade) b = b.eq('yearLevel', grade);
+    if (section) b = b.eq('section', section);
+    if (text) { const t = text.replace(/[,()%*]/g, ' '); b = b.or(`name.ilike.%${t}%,studentId.ilike.%${t}%`); }
+    return b;
+  };
+  if (filter === 'absent') {
+    const [students, recs, ex] = await Promise.all([q(narrow(sb.from('students').select('*'))), q(sb.from('daily').select('studentId').eq('date', day)), q(sb.from('excuses').select('studentId').eq('date', day))]);
+    const skip = new Set([...recs, ...ex].map(r => r.studentId));
+    return students.filter(s => !skip.has(s.studentId)).map(s => ({ date: day, name: s.name, studentId: s.studentId, yearLevel: s.yearLevel, section: s.section, photo: s.photo, absent: true }));
   }
-});
+  let b = narrow(sb.from('daily').select('*').gte('date', day).lte('date', to || day));
+  if (filter === 'late') b = b.eq('late', true);
+  if (filter === 'early') b = b.eq('earlyOut', true);
+  return q(b.order('date', { ascending: false }).order('created_at', { ascending: false }).limit(3000));
+}
+app.get('/api/attendance', W(async (req, res) => res.json(await attendance(req.query))));
 
-// EXPORT TO EXCEL
+app.get('/api/stats', W(async (req, res) => {
+  const date = ymd(new Date());
+  const [total, recs, excused] = await Promise.all([cnt('students'), q(sb.from('daily').select('*').eq('date', date)), cnt('excuses', b => b.eq('date', date))]);
+  const inside = recs.filter(r => { const last = ['pmOut', 'pmIn', 'amOut', 'amIn'].find(k => r[k]); return last && last.endsWith('In'); }).length;
+  res.json({ total, present: recs.length, absent: Math.max(total - recs.length - excused, 0), late: recs.filter(r => r.late).length, early: recs.filter(r => r.earlyOut).length, inside });
+}));
+
+app.get('/api/analytics', W(async (req, res) => {
+  const days = [...Array(14)].map((_, i) => ymd(new Date(Date.now() - i * 864e5))).reverse();
+  const [total, recs] = await Promise.all([cnt('students'), q(sb.from('daily').select('date,late').in('date', days))]);
+  res.json({ total, days: days.map(d => { const r = recs.filter(x => x.date === d); return { date: d, present: r.length, late: r.filter(x => x.late).length }; }) });
+}));
+
+// EXPORT TO EXCEL / CSV
 app.get('/api/export-excel', async (req, res) => {
   try {
-    await ensureExcelTemplateExists();
-
-    const selectedEvent = req.query.event;
-    let query = supabase.from('attendance').select('*').order('raw_timestamp', { ascending: false });
-    if (selectedEvent && selectedEvent !== 'ALL') {
-      query = query.eq('event', selectedEvent);
+    const c = await getConfig();
+    const rows = await attendance(req.query);
+    const cols = ['Date', 'ID Number', 'Student Name', 'Grade & Section', 'AM In', 'AM Out', 'PM In', 'PM Out', 'Status'];
+    const status = r => r.absent ? 'ABSENT' : [r.late && 'LATE', r.earlyOut && 'EARLY OUT'].filter(Boolean).join(', ') || 'ON TIME';
+    const data = rows.map(r => [r.date, r.studentId, r.name, `${r.yearLevel} - ${r.section}`, r.amIn || '', r.amOut || '', r.pmIn || '', r.pmOut || '', status(r)]);
+    if (req.query.format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', 'attachment; filename="Attendance_Report.csv"');
+      return res.send([cols, ...data].map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n'));
     }
-
-    const { data: attendance } = await query;
-
-    const templatePath = path.join(__dirname, 'template.xlsx');
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.readFile(templatePath);
-    const worksheet = workbook.getWorksheet(1);
-
-    let startRow = 5;
-
-    (attendance || []).forEach((row, index) => {
-      const currentRow = worksheet.getRow(startRow + index);
-      
-      currentRow.getCell(1).value = row.student_id;
-      currentRow.getCell(2).value = row.name;
-      currentRow.getCell(3).value = `${row.year_level || ''} - ${row.section || ''}`;
-      currentRow.getCell(4).value = row.position || 'Member';
-      currentRow.getCell(5).value = row.event;
-      currentRow.getCell(6).value = row.scan_type || 'TIME-IN';
-      currentRow.getCell(7).value = row.status;
-      currentRow.getCell(8).value = row.duration || 'N/A';
-      currentRow.getCell(9).value = row.timestamp;
-
-      currentRow.commit();
-    });
-
-    const filename = selectedEvent && selectedEvent !== 'ALL' 
-      ? `Attendance_${selectedEvent.replace(/\s+/g, '_')}.xlsx` 
-      : 'Attendance_Report.xlsx';
-
+    const wb = new ExcelJS.Workbook(), ws = wb.addWorksheet('Attendance Log');
+    ws.addRow([c.school.name]).font = { bold: true, size: 16 };
+    ws.addRow(['OFFICIAL ATTENDANCE REPORT']); ws.addRow([]);
+    const h = ws.addRow(cols);
+    h.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    h.eachCell(x => { x.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1B365D' } }; });
+    data.forEach(r => ws.addRow(r));
+    ws.columns.forEach(x => { x.width = 18; });
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-
-    await workbook.xlsx.write(res);
+    res.setHeader('Content-Disposition', 'attachment; filename="Attendance_Report.xlsx"');
+    await wb.xlsx.write(res);
     res.end();
-
   } catch (err) {
-    console.error('[EXCEL EXPORT ERROR]', err.message);
     res.status(500).send('Error generating Excel file: ' + err.message);
   }
 });
 
-// SETTINGS & ADMIN ENDPOINTS
-app.post('/api/update-system-name', async (req, res) => {
-  const { systemName } = req.body;
-  if (systemName) {
-    await supabase.from('config').update({ system_name: systemName }).eq('id', 1);
-  }
-  res.redirect('/');
+// GENERIC LISTS: grades, sections, teachers, announcements, excuses, notifications, logs, unauthorized, scan logs
+['grades', 'sections', 'teachers', 'announcements', 'excuses', 'notifications', 'logs', 'unauthorized', 'scanlogs'].forEach(t => {
+  app.get('/api/' + t, W(async (req, res) => {
+    let b = sb.from(t).select('*');
+    if (req.query.date) b = b.eq('date', req.query.date);
+    res.json((await q(b.order('created_at', { ascending: false }).limit(500))).map(m));
+  }));
+  app.post('/api/' + t, W(async (req, res) => {
+    const { _id, ...b } = req.body;
+    await q(_id ? sb.from(t).update(b).eq('id', _id) : sb.from(t).insert(b));
+    log(`Saved ${t}`); res.json({ ok: true });
+  }));
+  app.delete('/api/' + t + '/:id', W(async (req, res) => { await q(sb.from(t).delete().eq('id', req.params.id)); log(`Deleted from ${t}`); res.json({ ok: true }); }));
 });
 
-app.post('/api/upload-logo', upload.single('logoFile'), async (req, res) => {
-  if (req.file) {
-    const logoPath = `/uploads/${req.file.filename}`;
-    await supabase.from('config').update({ logo_path: logoPath }).eq('id', 1);
-  }
-  res.redirect('/');
-});
+// STUDENTS + RFID CARDS
+app.get('/api/students', W(async (req, res) => res.json((await q(sb.from('students').select('*').order('name'))).map(m))));
 
-app.post('/api/remove-logo', async (req, res) => {
-  await supabase.from('config').update({ logo_path: '' }).eq('id', 1);
-  res.redirect('/');
-});
+const taken = async (uid, except) => { let b = sb.from('students').select('id').eq('uid', uid); if (except) b = b.neq('id', except); return (await q(b.limit(1))).length > 0; };
 
-app.post('/api/notification-settings', async (req, res) => {
-  const { enableEmail, gmailUser, gmailPass, enableSms, semaphoreApiKey } = req.body;
-  await supabase.from('config').update({
-    enable_email: enableEmail === 'on',
-    gmail_user: gmailUser || '',
-    gmail_pass: gmailPass && gmailPass !== '******' ? gmailPass : undefined,
-    enable_sms: enableSms === 'on',
-    semaphore_api_key: semaphoreApiKey || ''
-  }).eq('id', 1);
-  res.redirect('/');
-});
-
-app.post('/api/event-settings', async (req, res) => {
-  const { newEvent, activeEvent, cutoffTime } = req.body;
-  const config = await getConfig();
-  let events = Array.isArray(config.events) ? config.events : ['General Event'];
-
-  if (newEvent && !events.includes(newEvent)) {
-    events.push(newEvent);
-    config.current_event = newEvent;
-  } else if (activeEvent) {
-    config.current_event = activeEvent;
-  }
-
-  const updatePayload = { events, current_event: config.current_event };
-  if (cutoffTime) updatePayload.cutoff_time = cutoffTime;
-
-  await supabase.from('config').update(updatePayload).eq('id', 1);
-  res.redirect('/');
-});
-
-app.post('/api/delete-event', async (req, res) => {
-  const { eventToDelete } = req.body;
-  if (eventToDelete) {
-    const config = await getConfig();
-    let events = (config.events || []).filter(e => e !== eventToDelete);
-    let currentEvent = config.current_event;
-    if (currentEvent === eventToDelete) {
-      currentEvent = events[0] || 'General Event';
-    }
-    await supabase.from('config').update({ events, current_event: currentEvent }).eq('id', 1);
-  }
-  res.redirect('/');
-});
-
-// REGISTER / EDIT PARTICIPANT WITH PHOTO SUPPORT
-app.post('/api/register', upload.single('photoFile'), async (req, res) => {
+app.post('/api/register', photoUpload.single('photo'), async (req, res) => {
   try {
-    const { studentIdId, uid, name, studentId, yearLevel, section, assignedEvent, position, customPosition, email, phone } = req.body;
-    let finalPosition = (position === 'Other' && customPosition) ? customPosition.trim() : position || 'Member';
-    const cleanUid = uid ? uid.trim().toUpperCase() : '';
-
-    let photoUrl = req.body.existingPhotoUrl || '';
+    const { mongoId, uid, name, studentId, yearLevel, section, email, phone } = req.body;
+    const cleanUid = (uid || '').trim().toUpperCase();
+    if (cleanUid && await taken(cleanUid, mongoId)) return res.status(409).json({ error: 'That RFID card is already assigned' });
+    const d = { uid: cleanUid, name, studentId, yearLevel: yearLevel || 'Grade 7', section: section || 'A', email: email || '', phone: phone || '' };
+    const id = mongoId || (await q(sb.from('students').insert(d).select('id').single())).id;
+    if (mongoId) await q(sb.from('students').update(d).eq('id', id));
     if (req.file) {
-      photoUrl = `/uploads/${req.file.filename}`;
+      await q(sb.from('photos').upsert({ student_id: id, type: req.file.mimetype, data: req.file.buffer.toString('base64') }));
+      await q(sb.from('students').update({ photo: `/photo/${id}?v=${Date.now()}` }).eq('id', id));
     }
+    log(`Saved student ${name}`); res.json({ ok: true });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
 
-    const payload = {
-      uid: cleanUid,
-      name,
-      student_id: studentId,
-      year_level: yearLevel || 'Grade 7',
-      section: section || 'A',
-      position: finalPosition,
-      email: email || '',
-      phone: phone || '',
-      assigned_event: assignedEvent || 'General Event',
-      photo_url: photoUrl
-    };
+app.get('/photo/:id', async (req, res) => {
+  const { data } = await sb.from('photos').select('type,data').eq('student_id', req.params.id).maybeSingle();
+  if (!data) return res.sendStatus(404);
+  res.type(data.type).send(Buffer.from(data.data, 'base64'));
+});
 
-    if (studentIdId) {
-      await supabase.from('students').update(payload).eq('id', studentIdId);
-    } else {
-      await supabase.from('students').insert([payload]);
-    }
-  } catch (err) {
-    console.error('[SAVE ERROR]', err.message);
+app.post('/api/delete-student', W(async (req, res) => { await q(sb.from('students').delete().eq('id', req.body.id)); log('Deleted a student'); res.json({ ok: true }); }));
+
+app.post('/api/card', W(async (req, res) => {
+  const { id, uid, cardStatus } = req.body, u = {};
+  if (uid !== undefined) u.uid = uid.trim().toUpperCase();
+  if (cardStatus) u.cardStatus = cardStatus;
+  if (u.uid && await taken(u.uid, id)) return res.status(409).json({ error: 'That RFID card is already assigned' });
+  await q(sb.from('students').update(u).eq('id', id));
+  log('RFID card updated'); res.json({ ok: true });
+}));
+
+// SETTINGS: schedule, school info, notifications, logo, admin account
+app.get('/api/config', W(async (req, res) => {
+  const c = await q(sb.from('config').select('*').eq('id', 1).maybeSingle()) || await getConfig();
+  delete c.adminPass; res.json(c);
+}));
+app.post('/api/config', W(async (req, res) => {
+  const c = await getConfig(), u = {};
+  for (const [k, v] of Object.entries(req.body)) {
+    const [a, b] = k.split('.');
+    if (!['sched', 'school', 'systemName', 'enableEmail', 'enableSms', 'semaphoreApiKey'].includes(a)) continue;
+    if (b) { u[a] = u[a] || { ...c[a] }; u[a][b] = v; } else u[a] = v;
   }
-  res.redirect('/');
-});
+  await setConfig(u); log('Settings updated'); res.json({ ok: true });
+}));
+app.post('/api/upload-logo', logoUpload.single('logoFile'), W(async (req, res) => {
+  if (req.file) await setConfig({ logoPath: `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}` });
+  res.json({ ok: true });
+}));
+app.post('/api/remove-logo', W(async (req, res) => { await setConfig({ logoPath: '' }); res.json({ ok: true }); }));
+app.post('/api/admin', W(async (req, res) => {
+  const c = await getConfig(), { oldPass, username, newPass } = req.body;
+  if (sha(oldPass) !== c.adminPass) return res.status(403).json({ error: 'Current password is wrong' });
+  await setConfig({ adminUser: username || c.adminUser, ...(newPass ? { adminPass: sha(newPass) } : {}) });
+  log('Admin account changed'); res.json({ ok: true });
+}));
 
-app.post('/api/delete-student', async (req, res) => {
-  const { id } = req.body;
-  if (id) await supabase.from('students').delete().eq('id', id);
-  res.redirect('/');
-});
+// BACKUP & RESTORE
+const BACKUP = ['students', 'photos', 'daily', 'scanlogs', 'grades', 'sections', 'teachers', 'announcements', 'excuses'];
+app.get('/api/backup', W(async (req, res) => {
+  const out = {};
+  for (const t of BACKUP) out[t] = await q(sb.from(t).select('*'));
+  res.setHeader('Content-Disposition', `attachment; filename="backup_${ymd(new Date())}.json"`);
+  res.json(out);
+}));
+app.post('/api/restore', W(async (req, res) => {
+  for (const t of [...BACKUP].reverse()) if (Array.isArray(req.body[t])) await q(sb.from(t).delete().not('created_at', 'is', null));
+  for (const t of BACKUP) if (req.body[t]?.length) await q(sb.from(t).insert(req.body[t]));
+  log('Backup restored'); res.json({ ok: true });
+}));
+app.post('/api/clear-logs', W(async (req, res) => {
+  await q(sb.from('daily').delete().neq('id', ZERO)); await q(sb.from('scanlogs').delete().neq('id', ZERO));
+  log('Cleared attendance logs'); res.json({ ok: true });
+}));
 
-app.post('/api/clear-logs', async (req, res) => {
-  await supabase.from('attendance').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-  res.redirect('/');
-});
+// PUBLIC STUDENT REGISTRATION FORM
+app.get('/student-register', W(async (req, res) => {
+  const grades = (await q(sb.from('grades').select('name').order('created_at'))).map(g => `<option>${g.name}</option>`).join('');
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Student Registration</title>
+  <link rel="stylesheet" href="/assets/style.css"></head><body class="login"><form method="POST" action="/api/register-student" class="box">
+  <h2>Student Registration</h2><input name="studentId" placeholder="ID Number (e.g. 2026-1001)" required><input name="name" placeholder="Full Name" required>
+  <select name="yearLevel">${grades}</select><input name="section" placeholder="Section (e.g. Diamond)" required>
+  <input type="email" name="email" placeholder="Parent / guardian email" required><input type="tel" name="phone" placeholder="Phone (optional)">
+  <button>Submit registration</button></form></body></html>`);
+}));
 
-// PUBLIC REGISTRATION FORM
-app.get('/register', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Participant Registration</title>
-      <style>
-        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f6f9; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px 0; }
-        .card { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); width: 100%; max-width: 420px; box-sizing: border-box; }
-        h2 { text-align: center; color: #2c3e50; margin-bottom: 20px; }
-        label { font-weight: bold; font-size: 14px; color: #34495e; }
-        input, select { width: 100%; padding: 10px; margin: 6px 0 16px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        button { width: 100%; background: #27ae60; color: white; padding: 12px; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 16px; margin-top: 10px; }
-        button:hover { background: #219150; }
-        .hidden { display: none; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h2>Participant Registration</h2>
-        <form action="/api/public-register" method="POST" enctype="multipart/form-data">
-          <label>ID Number / Badge ID:</label>
-          <input type="text" name="studentId" placeholder="e.g. 2026-0001" required>
-
-          <label>Full Name:</label>
-          <input type="text" name="name" placeholder="John Doe" required>
-
-          <label>Group / Section / Department:</label>
-          <input type="text" name="section" placeholder="e.g. IT Department / Section A" required>
-
-          <label>Position / Role:</label>
-          <select name="position" id="posSelect" onchange="checkCustom()" required>
-            <option value="Member">Member</option>
-            <option value="Officer">Officer</option>
-            <option value="Staff">Staff</option>
-            <option value="Guest">Guest</option>
-            <option value="Other">Custom Position...</option>
-          </select>
-
-          <div id="customBox" class="hidden">
-            <label>Specify Custom Role:</label>
-            <input type="text" name="customPosition" placeholder="Enter role">
-          </div>
-
-          <label>Email Address:</label>
-          <input type="email" name="email" placeholder="john@example.com" required>
-
-          <label>Profile Picture:</label>
-          <input type="file" name="photoFile" accept="image/*">
-
-          <button type="submit">Submit Registration</button>
-        </form>
-      </div>
-      <script>
-        function checkCustom() {
-          const val = document.getElementById('posSelect').value;
-          document.getElementById('customBox').classList.toggle('hidden', val !== 'Other');
-        }
-      </script>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/api/public-register', upload.single('photoFile'), async (req, res) => {
+app.post('/api/register-student', async (req, res) => {
   try {
-    const { name, email, studentId, section, position, customPosition } = req.body;
-    let finalPosition = (position === 'Other' && customPosition) ? customPosition.trim() : position || 'Member';
-    let photoUrl = req.file ? `/uploads/${req.file.filename}` : '';
-
-    await supabase.from('students').insert([{
-      name,
-      email,
-      student_id: studentId,
-      section: section || 'General',
-      position: finalPosition,
-      photo_url: photoUrl,
-      uid: ''
-    }]);
-
-    res.send(`
-      <div style="text-align:center; padding:50px; font-family:Arial;">
-        <h2 style="color:#2ecc71;">Registration Successful!</h2>
-        <p>Thank you <strong>${name}</strong>! Your information has been registered.</p>
-        <a href="/register" style="color:#2980b9; font-weight:bold; text-decoration:none;">Register another participant</a>
-      </div>
-    `);
-  } catch (err) {
-    res.status(500).send('Error: ' + err.message);
-  }
+    const { name, email, studentId, phone, yearLevel, section } = req.body;
+    if ((await q(sb.from('students').select('id').eq('email', email).limit(1))).length) return res.send('<h2 style="text-align:center;font-family:Arial;color:#e74c3c">That email is already registered. <a href="/student-register">Back</a></h2>');
+    await q(sb.from('students').insert({ name, email, studentId, phone: phone || '', yearLevel, section }));
+    res.send(`<div style="text-align:center;padding:50px;font-family:Arial"><h2 style="color:#2ecc71">Registration Successful!</h2>
+      <p>Thank you <strong>${name}</strong>! (${yearLevel} - ${section}). The admin will assign your RFID card.</p><a href="/student-register">Register another student</a></div>`);
+  } catch (err) { res.status(500).send('Error: ' + err.message); }
 });
 
-// REDESIGNED GENERAL ADMIN DASHBOARD ( / )
-app.get('/', async (req, res) => {
-  const config = await getConfig();
-  const eventList = Array.isArray(config.events) ? config.events : ['General Event'];
-  const eventOptions = eventList.map(e => `<option value="${e}" ${e === config.current_event ? 'selected' : ''}>${e}</option>`).join('');
-
-  const logoHtml = config.logo_path ? `<img src="${config.logo_path}" alt="System Logo" class="header-logo">` : '';
-
-  res.send(`
-  <!DOCTYPE html>
-  <html lang="en">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${config.system_name || 'General Attendance System'}</title>
-    <style>
-      :root {
-        --primary: #2563eb;
-        --primary-dark: #1d4ed8;
-        --success: #10b981;
-        --danger: #ef4444;
-        --warning: #f59e0b;
-        --bg: #f8fafc;
-        --card-bg: #ffffff;
-        --text: #1e293b;
-        --border: #e2e8f0;
-      }
-      body { font-family: 'Segoe UI', system-ui, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--text); }
-      .header-container { display: flex; align-items: center; justify-content: space-between; background: var(--card-bg); padding: 15px 25px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 20px; }
-      .header-left { display: flex; align-items: center; gap: 15px; }
-      .header-logo { height: 50px; width: auto; object-fit: contain; border-radius: 6px; }
-      h1, h2, h3 { color: var(--text); margin: 0; }
-      .grid-layout { display: grid; grid-template-columns: 1fr 380px; gap: 20px; }
-      @media(max-width: 1024px) { .grid-layout { grid-template-columns: 1fr; } }
-      .card { background: var(--card-bg); padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 20px; }
-      input, select { width: 100%; padding: 10px; margin: 6px 0 14px 0; border: 1px solid var(--border); border-radius: 6px; box-sizing: border-box; }
-      button, input[type="submit"] { background: var(--primary); color: white; padding: 10px 16px; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
-      button:hover, input[type="submit"]:hover { background: var(--primary-dark); }
-      .btn-danger { background: var(--danger); }
-      .btn-danger:hover { background: #dc2626; }
-      .btn-warning { background: var(--warning); }
-      .btn-warning:hover { background: #d97706; }
-      table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-      th, td { border-bottom: 1px solid var(--border); padding: 12px; text-align: left; font-size: 14px; }
-      th { background: #f1f5f9; font-weight: 600; color: #475569; }
-      .badge { padding: 4px 10px; border-radius: 9999px; font-weight: 600; font-size: 12px; display: inline-block; }
-      .badge-ontime { background: #d1fae5; color: #065f46; }
-      .badge-late { background: #fee2e2; color: #991b1b; }
-      .badge-in { background: #e0f2fe; color: #0369a1; }
-      .badge-out { background: #f3e8ff; color: #6b21a8; }
-      .scanner-display { background: #0f172a; color: white; padding: 25px; border-radius: 12px; text-align: center; margin-bottom: 20px; display: flex; align-items: center; gap: 25px; }
-      .scanner-avatar { width: 120px; height: 120px; border-radius: 50%; object-fit: cover; border: 4px solid var(--primary); background: #334155; }
-      .scanner-info { text-align: left; flex: 1; }
-      .nav-links { margin-bottom: 15px; font-size: 14px; }
-      .nav-links a { color: var(--primary); text-decoration: none; font-weight: 600; }
-    </style>
-  </head>
-  <body>
-
-    <div class="header-container">
-      <div class="header-left">
-        ${logoHtml}
-        <h1>${config.system_name || 'General Attendance System'}</h1>
-      </div>
-      <div class="nav-links">
-        <a href="/register" target="_blank">📋 Public Registration Form</a>
-      </div>
-    </div>
-
-    <!-- LIVE RFID SCANNER VISUAL & AUDIO FEEDBACK -->
-    <div class="scanner-display" id="scannerCard">
-      <img id="livePhoto" src="/uploads/default-avatar.png" class="scanner-avatar" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'120\' height=\'120\'><rect width=\'100%\' height=\'100%\' fill=\'%23334155\'/><text x=\'50%\' y=\'50%\' fill=\'%2394a3b8\' dominant-baseline=\'middle\' text-anchor=\'middle\' font-size=\'14\'>No Photo</text></svg>'">
-      <div class="scanner-info">
-        <div style="font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #94a3b8; margin-bottom: 4px;">Latest RFID Scan Feedback</div>
-        <h2 id="liveName" style="color: #ffffff; font-size: 26px; margin-bottom: 5px;">Waiting for RFID scan...</h2>
-        <p id="liveDetails" style="color: #cbd5e1; margin: 0; font-size: 15px;">Scan any card to instantly display info and announce name.</p>
-        <div style="margin-top: 8px;"><span id="liveBadge" class="badge badge-in">ID: <span id="liveUidDisplay">${config.latest_uid || 'None'}</span></span></div>
-      </div>
-    </div>
-
-    <div class="grid-layout">
-      <!-- LEFT COLUMN: TABLES -->
-      <div>
-        <div class="card">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-            <h2>Live Attendance Logs</h2>
-            <div style="display: flex; gap: 10px; align-items: center;">
-              <select id="exportEventSelect" style="width: auto; margin:0;">
-                <option value="ALL">All Events</option>
-                ${eventOptions}
-              </select>
-              <button onclick="downloadExcel()">Export Excel</button>
-              <form action="/api/clear-logs" method="POST" onsubmit="return confirm('Clear all attendance logs?');" style="margin:0;">
-                <button type="submit" class="btn-danger">Clear Logs</button>
-              </form>
-            </div>
-          </div>
-          <div style="overflow-x: auto;">
-            <table>
-              <thead>
-                <tr>
-                  <th>Participant</th>
-                  <th>ID Number</th>
-                  <th>Department / Section</th>
-                  <th>Event</th>
-                  <th>Type</th>
-                  <th>Status</th>
-                  <th>Duration</th>
-                  <th>Time</th>
-                </tr>
-              </thead>
-              <tbody id="attendanceTableBody"></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Registered Participants Database</h2>
-          <div style="overflow-x: auto;">
-            <table>
-              <thead>
-                <tr>
-                  <th>Photo</th>
-                  <th>ID Number</th>
-                  <th>Name</th>
-                  <th>Section</th>
-                  <th>Position</th>
-                  <th>Assigned Event</th>
-                  <th>Card UID</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody id="studentsTableBody"></tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-
-      <!-- RIGHT COLUMN: SETTINGS & REGISTRATION -->
-      <div>
-        <div class="card">
-          <h3 id="formTitle">Register / Edit Participant</h3>
-          <form action="/api/register" method="POST" enctype="multipart/form-data" id="registerForm" style="margin-top: 15px;">
-            <input type="hidden" id="studentIdIdInput" name="studentIdId">
-            <input type="hidden" id="existingPhotoUrlInput" name="existingPhotoUrl">
-
-            <label><strong>RFID Card UID:</strong></label>
-            <div style="display: flex; gap: 8px;">
-              <input type="text" id="uidInput" name="uid" placeholder="Scan or type UID">
-              <button type="button" onclick="useLatestUid()" style="margin-top: 6px; white-space: nowrap;">Get Last UID</button>
-            </div>
-
-            <label><strong>ID Number:</strong></label>
-            <input type="text" id="studentIdInput" name="studentId" placeholder="e.g. 2026-001" required>
-
-            <label><strong>Full Name:</strong></label>
-            <input type="text" id="nameInput" name="name" placeholder="Full Name" required>
-
-            <label><strong>Group / Section:</strong></label>
-            <input type="text" id="sectionInput" name="section" placeholder="e.g. Section A / IT Dept" required>
-
-            <label><strong>Position / Role:</strong></label>
-            <select id="positionSelect" name="position">
-              <option value="Member">Member</option>
-              <option value="Officer">Officer</option>
-              <option value="Staff">Staff</option>
-              <option value="Guest">Guest</option>
-            </select>
-
-            <label><strong>Assign Event:</strong></label>
-            <select id="eventSelect" name="assignedEvent">${eventOptions}</select>
-
-            <label><strong>Profile Picture:</strong></label>
-            <input type="file" name="photoFile" accept="image/*">
-
-            <div style="display: flex; gap: 10px; margin-top: 10px;">
-              <input type="submit" id="submitBtn" value="Save Participant" style="flex: 1; margin: 0;">
-              <button type="button" id="cancelEditBtn" onclick="resetForm()" class="btn-danger" style="display: none; flex: 1;">Cancel</button>
-            </div>
-          </form>
-        </div>
-
-        <div class="card">
-          <h3>System & Event Settings</h3>
-          <form action="/api/update-system-name" method="POST" style="margin-top: 10px;">
-            <label>System Title:</label>
-            <input type="text" name="systemName" value="${config.system_name || 'General Attendance System'}">
-            <input type="submit" value="Update Title">
-          </form>
-
-          <hr style="border: 0; border-top: 1px solid var(--border); margin: 15px 0;">
-
-          <form action="/api/event-settings" method="POST">
-            <label>Active Event:</label>
-            <select name="activeEvent">${eventOptions}</select>
-
-            <label>Add New Event:</label>
-            <input type="text" name="newEvent" placeholder="Event Name">
-
-            <label>Late Cut-off Time:</label>
-            <input type="time" name="cutoffTime" value="${config.cutoff_time || '08:00'}">
-
-            <input type="submit" value="Save Event Settings">
-          </form>
-        </div>
-      </div>
-    </div>
-
-    <script>
-      let registeredStudents = [];
-      let lastSpokenUid = '';
-
-      function speakName(text) {
-        if ('speechSynthesis' in window) {
-          window.speechSynthesis.cancel(); // Stop any pending speech
-          const utterance = new SpeechSynthesisUtterance(text);
-          utterance.rate = 1.0;
-          utterance.pitch = 1.0;
-          window.speechSynthesis.speak(utterance);
-        }
-      }
-
-      function editStudent(id) {
-        const st = registeredStudents.find(s => s.id === id);
-        if (!st) return;
-
-        document.getElementById('studentIdIdInput').value = st.id;
-        document.getElementById('uidInput').value = st.uid || '';
-        document.getElementById('studentIdInput').value = st.student_id;
-        document.getElementById('nameInput').value = st.name;
-        document.getElementById('sectionInput').value = st.section || '';
-        if (st.position) document.getElementById('positionSelect').value = st.position;
-        if (st.assigned_event) document.getElementById('eventSelect').value = st.assigned_event;
-        document.getElementById('existingPhotoUrlInput').value = st.photo_url || '';
-
-        document.getElementById('formTitle').innerText = 'Edit Participant (' + st.name + ')';
-        document.getElementById('submitBtn').value = 'Update Participant';
-        document.getElementById('cancelEditBtn').style.display = 'block';
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-      }
-
-      function resetForm() {
-        document.getElementById('registerForm').reset();
-        document.getElementById('studentIdIdInput').value = '';
-        document.getElementById('existingPhotoUrlInput').value = '';
-        document.getElementById('formTitle').innerText = 'Register / Edit Participant';
-        document.getElementById('submitBtn').value = 'Save Participant';
-        document.getElementById('cancelEditBtn').style.display = 'none';
-      }
-
-      async function updateDashboard() {
-        try {
-          const res = await fetch('/api/live-data');
-          const data = await res.json();
-          registeredStudents = data.students || [];
-
-          if (data.latestUid) {
-            document.getElementById('liveUidDisplay').innerText = data.latestUid;
-
-            // Find latest attendance or student corresponding to this UID
-            const latestScan = data.attendance && data.attendance.length > 0 ? data.attendance[0] : null;
-            if (latestScan && latestScan.uid === data.latestUid) {
-              const matchedStudent = registeredStudents.find(s => s.uid === data.latestUid);
-              const photo = matchedStudent && matchedStudent.photo_url ? matchedStudent.photo_url : '/uploads/default-avatar.png';
-              
-              document.getElementById('livePhoto').src = photo;
-              document.getElementById('liveName').innerText = latestScan.name + ' (' + latestScan.scan_type + ')';
-              document.getElementById('liveDetails').innerText = 'ID: ' + latestScan.student_id + ' | ' + latestScan.section + ' | Status: ' + latestScan.status + ' | ' + latestScan.timestamp;
-
-              // Speak name aloud if new UID scan detected
-              if (lastSpokenUid !== data.latestUid + '-' + latestScan.timestamp) {
-                lastSpokenUid = data.latestUid + '-' + latestScan.timestamp;
-                speakName(latestScan.name + " " + latestScan.scan_type);
-              }
-            }
-          }
-
-          // Render Attendance Table
-          const tbody = document.getElementById('attendanceTableBody');
-          if (!data.attendance || data.attendance.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:#94a3b8;">No attendance records found.</td></tr>';
-          } else {
-            tbody.innerHTML = data.attendance.map(row => {
-              const typeBadge = row.scan_type === 'TIME-OUT' ? '<span class="badge badge-out">TIME-OUT</span>' : '<span class="badge badge-in">TIME-IN</span>';
-              const statusBadge = row.status === 'LATE' ? '<span class="badge badge-late">LATE</span>' : '<span class="badge badge-ontime">' + row.status + '</span>';
-              return \`
-                <tr>
-                  <td><strong>\${row.name}</strong></td>
-                  <td>\${row.student_id}</td>
-                  <td>\${row.section}</td>
-                  <td>\${row.event}</td>
-                  <td>\${typeBadge}</td>
-                  <td>\${statusBadge}</td>
-                  <td><strong>\${row.duration || 'N/A'}</strong></td>
-                  <td>\${row.timestamp}</td>
-                </tr>
-              \`;
-            }).join('');
-          }
-
-          // Render Students Table
-          const stBody = document.getElementById('studentsTableBody');
-          if (!registeredStudents || registeredStudents.length === 0) {
-            stBody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:#94a3b8;">No participants registered.</td></tr>';
-          } else {
-            stBody.innerHTML = registeredStudents.map(st => {
-              const imgTag = st.photo_url ? \`<img src="\${st.photo_url}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;">\` : '<span style="color:#94a3b8;font-size:12px;">No Image</span>';
-              return \`
-                <tr>
-                  <td>\${imgTag}</td>
-                  <td>\${st.student_id}</td>
-                  <td><strong>\${st.name}</strong></td>
-                  <td>\${st.section || 'N/A'}</td>
-                  <td><span style="color:var(--primary); font-weight:600;">\${st.position || 'Member'}</span></td>
-                  <td>\${st.assigned_event || 'General Event'}</td>
-                  <td>\${st.uid ? '<code>' + st.uid + '</code>' : '<span style="color:#f59e0b;font-weight:600;">Unlinked</span>'}</td>
-                  <td>
-                    <button type="button" class="btn-warning" onclick="editStudent('\${st.id}')" style="padding:6px 10px; font-size:12px;">Edit</button>
-                    <form action="/api/delete-student" method="POST" style="display:inline;" onsubmit="return confirm('Delete participant?');">
-                      <input type="hidden" name="id" value="\$.id}">
-                      <button type="submit" class="btn-danger" style="padding:6px 10px; font-size:12px;">Delete</button>
-                    </form>
-                  </td>
-                </tr>
-              \`;
-            }).join('');
-          }
-
-        } catch (err) {}
-      }
-
-      function useLatestUid() {
-        const uid = document.getElementById('liveUidDisplay').innerText;
-        if (uid && uid !== 'None') document.getElementById('uidInput').value = uid;
-      }
-
-      function downloadExcel() {
-        const selected = document.getElementById('exportEventSelect').value;
-        window.location.href = '/api/export-excel?event=' + encodeURIComponent(selected);
-      }
-
-      updateDashboard();
-      setInterval(updateDashboard, 2000);
-    </script>
-  </body>
-  </html>
-  `);
-});
+// PAGES: admin dashboard ( / ) and separate scanning screen ( /scanner )
+app.get('/', (req, res) => res.type('html').send(INDEX_HTML));
+app.get('/scanner', (req, res) => res.type('html').send(SCANNER_HTML));
 
 // START SERVER
 app.listen(PORT, async () => {
-  await ensureExcelTemplateExists();
-  console.log(`General Attendance Server running on port ${PORT}`);
+  try {
+    if (!await cnt('grades')) await q(sb.from('grades').insert([7, 8, 9, 10, 11, 12].map(n => ({ name: 'Grade ' + n }))));
+    await getConfig();
+    console.log('[DATABASE] Connected to Supabase successfully!');
+  } catch (e) { console.error('[DATABASE ERROR] Did you run schema.sql in Supabase? ', e.message); }
+  console.log(`Server running on port ${PORT}`);
+  console.log('[SCANNER] ESP8266 must POST uid to http://<this-server>/api/scan');
 });
