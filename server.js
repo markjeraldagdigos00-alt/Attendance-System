@@ -9,8 +9,14 @@ const { Resend } = require('resend');
 const { createClient } = require('@supabase/supabase-js');
 
 // ===== DATABASE (Supabase / PostgreSQL) - tables are created by schema.sql =====
-const SUPABASE_URL = process.env.SUPABASE_URL, SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
-if (!SUPABASE_URL || !SUPABASE_KEY) { console.error('Set SUPABASE_URL and SUPABASE_SERVICE_KEY first.'); process.exit(1); }
+const env = (...names) => { for (const k of names) if ((process.env[k] || '').trim()) return process.env[k].trim(); };
+const SUPABASE_URL = (env('SUPABASE_URL', 'SUPABASE_PROJECT_URL') || '').replace(/\/+$/, '');
+const SUPABASE_KEY = env('SUPABASE_SERVICE_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_KEY');
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('Missing environment variable(s): ' + [!SUPABASE_URL && 'SUPABASE_URL', !SUPABASE_KEY && 'SUPABASE_SERVICE_KEY'].filter(Boolean).join(', '));
+  console.error('Variables this service can see with "supabase" in the name: ' + (Object.keys(process.env).filter(k => /supabase/i.test(k)).join(', ') || '(none)'));
+  process.exit(1);
+}
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 const q = async p => { const { data, error } = await p; if (error) throw new Error(error.message); return data; };
 const cnt = async (t, f) => { let b = sb.from(t).select('id', { count: 'exact', head: true }); if (f) b = f(b); const { count, error } = await b; if (error) throw new Error(error.message); return count; };
